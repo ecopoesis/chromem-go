@@ -2,10 +2,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"io"
+	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -15,13 +16,18 @@ import (
 )
 
 const (
-	question = "When did the Monarch Company exist?"
+	question = "How does ATA's system of record work?"
 	// We use a local LLM running in Ollama for the embedding: https://huggingface.co/nomic-ai/nomic-embed-text-v1.5
 	embeddingModel = "nomic-embed-text"
 )
 
 func main() {
 	ctx := context.Background()
+
+	confluenceFilename := regexp.MustCompile(`.*-([0-9]+).txt`)
+	sphinxFilename := regexp.MustCompile(`(.+).md`)
+	gitHubDocsFilename := regexp.MustCompile(`.*/docs/(.+\.md)`)
+	dokkaFilename := regexp.MustCompile(`.*/dokka/(.+).md`)
 
 	// Warm up Ollama, in case the model isn't loaded yet
 	log.Println("Warming up Ollama...")
@@ -50,56 +56,133 @@ func main() {
 	// variable to be set.
 	// For this example we choose to use a locally running embedding model though.
 	// It requires Ollama to serve its API at "http://localhost:11434/api".
-	collection, err := db.GetOrCreateCollection("Wikipedia", nil, chromem.NewEmbeddingFuncOllama(embeddingModel, ""))
+	collection, err := db.GetOrCreateCollection("ATA", nil, chromem.NewEmbeddingFuncOllama(embeddingModel, ""))
 	if err != nil {
 		panic(err)
 	}
 	// Add docs to the collection, if the collection was just created (and not
 	// loaded from persistent storage).
 	var docs []chromem.Document
+	var docsCount int
 	if collection.Count() == 0 {
-		// Here we use a DBpedia sample, where each line contains the lead section/introduction
-		// to some Wikipedia article and its category.
-		f, err := os.Open("dbpedia_sample.jsonl")
+		log.Println("Reading text files from Confluence...")
+		confluenceFiles, err := os.ReadDir("/Users/mroberts/code/Conf-Thief/txt")
 		if err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
-		defer f.Close()
-		d := json.NewDecoder(f)
-		log.Println("Reading JSON lines...")
-		for i := 1; ; i++ {
-			var article struct {
-				Text     string `json:"text"`
-				Category string `json:"category"`
+
+		for _, file := range confluenceFiles {
+			if !file.IsDir() {
+				log.Println("Processing file: " + file.Name())
+				data, _ := ioutil.ReadFile("/Users/mroberts/code/Conf-Thief/txt/" + file.Name())
+				content := "search_document: " + string(data)
+				matches := confluenceFilename.FindStringSubmatch(file.Name())
+				docs = append(docs, chromem.Document{
+					ID:       "confluence-" + matches[1],
+					Metadata: map[string]string{"category": "Confluence", "url": "https://cargurus.atlassian.net/wiki/spaces/ATA/pages/" + matches[1]},
+					Content:  content,
+				})
+				docsCount++
 			}
-			err := d.Decode(&article)
-			if err == io.EOF {
-				break // reached end of file
-			} else if err != nil {
-				panic(err)
+		}
+
+		log.Println("Reading text files from Sphinx...")
+		sphinxFiles, err := os.ReadDir("/Users/mroberts/code/ata-kt/sphinx/source/adr")
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		for _, file := range sphinxFiles {
+			if !file.IsDir() && strings.HasSuffix(file.Name(), ".md") {
+				log.Println("Processing file: " + file.Name())
+				data, _ := ioutil.ReadFile("/Users/mroberts/code/ata-kt/sphinx/source/adr/" + file.Name())
+				content := "search_document: " + string(data)
+				matches := sphinxFilename.FindStringSubmatch(file.Name())
+				docs = append(docs, chromem.Document{
+					ID:       "sphinx-" + matches[1],
+					Metadata: map[string]string{"category": "Sphinx", "url": "https://docs.ata.n-gurus.com/adr/" + matches[1] + ".html"},
+					Content:  content,
+				})
+				docsCount++
+			}
+		}
+
+		log.Println("Reading text files from GitHub root...")
+		gitHubFiles, err := os.ReadDir("/Users/mroberts/code/ata-kt")
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, file := range gitHubFiles {
+			if !file.IsDir() && strings.HasSuffix(file.Name(), ".md") {
+				log.Println("Processing file: " + file.Name())
+				data, _ := ioutil.ReadFile("/Users/mroberts/code/ata-kt/" + file.Name())
+				content := "search_document: " + string(data)
+				docs = append(docs, chromem.Document{
+					ID:       "github-" + file.Name(),
+					Metadata: map[string]string{"category": "Sphinx", "url": "https://code.cargurus.com/cargurus-sem/ata-kt/blob/main/" + file.Name()},
+					Content:  content,
+				})
+				docsCount++
+			}
+		}
+
+		log.Println("Reading text files from GitHub /docs...")
+		err = filepath.Walk("/Users/mroberts/code/ata-kt/docs", func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
 			}
 
-			// The embeddings model we use in this example ("nomic-embed-text")
-			// fare better with a prefix to differentiate between document and query.
-			// We'll have to cut it off later when we retrieve the documents.
-			// An alternative is to create the embedding with `chromem.NewDocument()`,
-			// and then change back the content before adding it do the collection
-			// with `collection.AddDocument()`.
-			content := "search_document: " + article.Text
+			if !info.IsDir() && strings.HasSuffix(path, ".md") {
+				log.Println("Processing file: " + path)
+				data, _ := ioutil.ReadFile(path)
+				content := "search_document: " + string(data)
+				matches := gitHubDocsFilename.FindStringSubmatch(path)
+				docs = append(docs, chromem.Document{
+					ID:       "githubdocs-" + matches[1],
+					Metadata: map[string]string{"category": "Sphinx", "url": "https://code.cargurus.com/cargurus-sem/ata-kt/blob/main/docs/" + matches[1]},
+					Content:  content,
+				})
+				docsCount++
+			}
 
-			docs = append(docs, chromem.Document{
-				ID:       strconv.Itoa(i),
-				Metadata: map[string]string{"category": article.Category},
-				Content:  content,
-			})
+			return nil
+		})
+		if err != nil {
+			log.Fatal(err)
 		}
-		log.Println("Adding documents to chromem-go, including creating their embeddings via Ollama API...")
+
+		log.Println("Reading text files from Dooka...")
+		err = filepath.Walk("/Users/mroberts/code/ata-kt/sphinx/source/dokka", func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if !info.IsDir() && strings.HasSuffix(path, ".md") {
+				log.Println("Processing file: " + path)
+				data, _ := ioutil.ReadFile(path)
+				content := "search_document: " + string(data)
+				matches := dokkaFilename.FindStringSubmatch(path)
+				docs = append(docs, chromem.Document{
+					ID:       "dokka-" + matches[1],
+					Metadata: map[string]string{"category": "Dokka", "url": "https://docs.ata.n-gurus.com/dokka/" + matches[1] + ".html"},
+					Content:  content,
+				})
+				docsCount++
+			}
+
+			return nil
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		log.Println("Adding " + strconv.Itoa(docsCount) + " documents to chromem-go, including creating their embeddings via Ollama API...")
 		err = collection.AddDocuments(ctx, docs, runtime.NumCPU())
 		if err != nil {
 			panic(err)
 		}
 	} else {
-		log.Println("Not reading JSON lines because collection was loaded from persistent storage.")
+		log.Println("Not reading files because collection was loaded from persistent storage.")
 	}
 
 	// Search for documents that are semantically similar to the original question.
@@ -111,7 +194,7 @@ func main() {
 	log.Println("Querying chromem-go...")
 	// "nomic-embed-text" specific prefix (not required with OpenAI's or other models)
 	query := "search_query: " + question
-	docRes, err := collection.Query(ctx, query, 2, nil, nil)
+	docRes, err := collection.Query(ctx, query, 10, nil, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -119,17 +202,25 @@ func main() {
 	// Here you could filter out any documents whose similarity is below a certain threshold.
 	// if docRes[...].Similarity < 0.5 { ...
 
-	// Print the retrieved documents and their similarity to the question.
-	for i, res := range docRes {
-		// Cut off the prefix we added before adding the document (see comment above).
-		// This is specific to the "nomic-embed-text" model.
-		content := strings.TrimPrefix(res.Content, "search_document: ")
-		log.Printf("Document %d (similarity: %f): \"%s\"\n", i+1, res.Similarity, content)
-	}
+	/*	// Print the retrieved documents and their similarity to the question.
+		for i, res := range docRes {
+			// Cut off the prefix we added before adding the document (see comment above).
+			// This is specific to the "nomic-embed-text" model.
+			content := strings.TrimPrefix(res.Content, "search_document: ")
+			log.Printf("Document %d (similarity: %f): \"%s\"\n", i+1, res.Similarity, content)
+		}*/
 
 	// Now we can ask the LLM again, augmenting the question with the knowledge we retrieved.
 	// In this example we just use both retrieved documents as context.
-	contexts := []string{docRes[0].Content, docRes[1].Content}
+	var contexts []map[string]string
+
+	for _, doc := range docRes {
+		contexts = append(contexts, map[string]string{
+			"content": doc.Content,
+			"url":     doc.Metadata["url"],
+		})
+	}
+
 	log.Println("Asking LLM with augmented question...")
 	reply = askLLM(ctx, contexts, question)
 	log.Printf("Reply after augmenting the question with knowledge: \"" + reply + "\"\n")
